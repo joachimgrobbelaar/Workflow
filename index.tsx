@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { createRoot } from "react-dom/client";
+import { GoogleGenAI } from "@google/genai";
 import { jsPDF } from "jspdf";
 import "./index.css";
 
@@ -46,6 +47,36 @@ const downloadFile = (url, filename) => {
     if (url.startsWith('blob:')) {
         URL.revokeObjectURL(url);
     }
+};
+
+const ApiKeyModal = ({ onSave, onCancel }) => {
+    const [key, setKey] = useState('');
+
+    const handleSave = () => {
+        if (key.trim()) {
+            onSave(key.trim());
+        }
+    };
+
+    return (
+        <div className="api-key-modal-overlay" onClick={onCancel}>
+            <div className="api-key-modal" onClick={(e) => e.stopPropagation()}>
+                <h3>Enter OpenAI API Key</h3>
+                <p>A GPT-4 node requires an OpenAI API key to run. This key is only stored for this session and will not be saved.</p>
+                <input
+                    type="password"
+                    value={key}
+                    onChange={(e) => setKey(e.target.value)}
+                    placeholder="sk-..."
+                    aria-label="OpenAI API Key"
+                />
+                <div className="api-key-modal-buttons">
+                    <button onClick={onCancel} className="cancel-btn">Cancel</button>
+                    <button onClick={handleSave} disabled={!key.trim()} className="save-btn">Save and Run</button>
+                </div>
+            </div>
+        </div>
+    );
 };
 
 const SettingsPanel = ({ node, onSave, onClose }) => {
@@ -215,7 +246,7 @@ const SettingsPanel = ({ node, onSave, onClose }) => {
   );
 };
 
-const executePipeline = async (workflowData, stateUpdaters) => {
+const executePipeline = async (workflowData, stateUpdaters, openAiApiKey = '') => {
     const { nodes, edges } = workflowData;
     const {
         setIsRunning,
@@ -240,6 +271,17 @@ const executePipeline = async (workflowData, stateUpdaters) => {
     };
 
     try {
+        const needsGemini = nodes.some(n =>
+            (n.type === 'prompt' && n.settings.llm !== 'gpt-4') ||
+            n.type === 'process' ||
+            (n.type === 'output' && n.settings.outputType === 'image')
+        );
+        
+        if (needsGemini && !process.env.API_KEY) {
+            throw new Error("A node requiring the Gemini API is present, but the API_KEY environment variable is not set.");
+        }
+
+      const ai = needsGemini ? new GoogleGenAI({ apiKey: process.env.API_KEY }) : null;
       const nodeMap = new Map(nodes.map(node => [node.id, node]));
       const adj = new Map<number, number[]>(nodes.map(node => [node.id, []]));
       const inDegree = new Map<number, number>(nodes.map(node => [node.id, 0]));
@@ -314,27 +356,41 @@ const executePipeline = async (workflowData, stateUpdaters) => {
             case 'prompt': {
                 const promptText = inputData || node.settings.promptText;
                 const model = node.settings.llm || 'gemini-2.5-flash';
-                log(`Sending request to backend for ${model}: "${promptText.substring(0, 100)}..."`, "data");
-                
-                const response = await fetch('/api/ai-request', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model: model,
-                        prompt: promptText,
-                        task: 'generate_text'
-                    })
-                });
+                log(`Using prompt with ${model}: "${promptText.substring(0, 100)}..."`, "data");
+                let text = '';
 
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.error || `Backend API error: ${response.status}`);
+                if (model === 'gpt-4') {
+                    if (!openAiApiKey) throw new Error('OpenAI API key is missing.');
+                    const openAIResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${openAiApiKey}`
+                        },
+                        body: JSON.stringify({
+                            model: 'gpt-4',
+                            messages: [{ role: 'user', content: promptText }]
+                        })
+                    });
+                    if (!openAIResponse.ok) {
+                        const errorData = await openAIResponse.json();
+                        throw new Error(`OpenAI API error: ${openAIResponse.status} - ${errorData.error?.message || 'Unknown error'}`);
+                    }
+                    const data = await openAIResponse.json();
+                    text = data.choices[0].message.content;
+                    log(`OpenAI response: "${text.substring(0, 100)}..."`, "success");
+                } else {
+                    if (!ai) throw new Error('Gemini AI client not initialized.');
+                    if (model !== 'gemini-2.5-flash') {
+                        log(`Model ${model} not implemented. Falling back to Gemini.`, "info");
+                    }
+                    const response = await ai.models.generateContent({
+                        model: 'gemini-2.5-flash',
+                        contents: promptText,
+                    });
+                    text = response.text;
+                    log(`Gemini response: "${text.substring(0, 100)}..."`, "success");
                 }
-
-                const result = await response.json();
-                const text = result.text;
-
-                log(`${model} response: "${text.substring(0, 100)}..."`, "success");
                 outputs.set(node.id, text);
                 break;
             }
@@ -344,28 +400,27 @@ const executePipeline = async (workflowData, stateUpdaters) => {
                 outputs.set(node.id, '');
                 break;
               }
+              if (!ai) throw new Error('Gemini AI client not initialized for process node.');
               const processType = node.settings.processType || 'merge';
+              let processPrompt = '';
               log(`Processing ${inputDataArray.length} inputs with mode: ${processType}`, "data");
-              
-              const processResponse = await fetch('/api/ai-request', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model: 'gemini-2.5-flash',
-                        inputs: inputDataArray,
-                        processType: processType,
-                        task: 'process_text'
-                    })
-              });
-
-              if (!processResponse.ok) {
-                  const errorData = await processResponse.json();
-                  throw new Error(errorData.error || `Backend API error: ${processResponse.status}`);
+              switch(processType) {
+                case 'diff':
+                  processPrompt = `Analyze the following ${inputDataArray.length} pieces of text and provide a concise, bullet-point summary of the key contrasting points and differences between them.\n\n--- Texts for Comparison ---\n\n${inputDataArray.map((input, i) => `Text ${i + 1}:\n${input}`).join('\n\n')}`;
+                  break;
+                case 'common':
+                  processPrompt = `Analyze the following ${inputDataArray.length} pieces of text and generate a concise, bullet-point summary of the shared themes, overlapping information, and commonalities found across all of them.\n\n--- Texts for Analysis ---\n\n${inputDataArray.map((input, i) => `Text ${i + 1}:\n${input}`).join('\n\n')}`;
+                  break;
+                case 'merge':
+                default:
+                  processPrompt = `Intelligently combine the following ${inputDataArray.length} pieces of text into a single, coherent, and well-structured document. Maintain the core information and logical flow, avoiding redundancy where possible.\n\n--- Texts to Merge ---\n\n${inputDataArray.map((input, i) => `Piece ${i + 1}:\n${input}`).join('\n\n')}`;
+                  break;
               }
-              
-              const processResult = await processResponse.json();
-              const processedText = processResult.text;
-              
+              const processResponse = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: processPrompt,
+              });
+              const processedText = processResponse.text;
               outputs.set(node.id, processedText);
               log(`Process result: "${processedText.substring(0, 100)}..."`, "success");
               break;
@@ -390,23 +445,15 @@ const executePipeline = async (workflowData, stateUpdaters) => {
                   break;
                 }
                 case 'image': {
-                  log(`Generating Image from prompt via backend...`, "data");
-                  const imageResponse = await fetch('/api/ai-request', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        prompt: inputData,
-                        task: 'generate_image'
-                    })
+                  if (!ai) throw new Error('Gemini AI client not initialized for image generation.');
+                  log(`Generating Image from prompt...`, "data");
+                  const imageResponse = await ai.models.generateImages({
+                    model: 'imagen-3.0-generate-002',
+                    prompt: inputData,
+                    config: { numberOfImages: 1 },
                   });
-
-                  if (!imageResponse.ok) {
-                    const errorData = await imageResponse.json();
-                    throw new Error(errorData.error || `Backend API error: ${imageResponse.status}`);
-                  }
-              
-                  const imageResult = await imageResponse.json();
-                  const imageUrl = `data:image/png;base64,${imageResult.base64Image}`;
+                  const base64Image = imageResponse.generatedImages[0].image.imageBytes;
+                  const imageUrl = `data:image/png;base64,${base64Image}`;
                   const fileName = `${node.name.replace(/\s+/g, '_')}_${Date.now()}.png`;
                   addFile({ name: fileName, url: imageUrl });
                   if (action === 'download') { downloadFile(imageUrl, fileName); } 
@@ -469,6 +516,8 @@ const EditorPage = ({ workflowId, onNavigateHome }) => {
   const [currentlyExecutingNodeId, setCurrentlyExecutingNodeId] = useState(null);
   const [hoveredEdgeId, setHoveredEdgeId] = useState(null);
   const [workflowName, setWorkflowName] = useState("Untitled Workflow");
+  const [openAiApiKey, setOpenAiApiKey] = useState("");
+  const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
   const [currentWorkflowId, setCurrentWorkflowId] = useState(workflowId);
 
   useEffect(() => {
@@ -731,13 +780,20 @@ const EditorPage = ({ workflowId, onNavigateHome }) => {
   }
 
   const handleRun = () => {
+    const needsOpenAI = nodes.some(n => n.type === 'prompt' && n.settings.llm === 'gpt-4');
+
+    if (needsOpenAI && !openAiApiKey) {
+        setIsApiKeyModalOpen(true);
+        return; // Stop execution, modal will trigger it.
+    }
+
     const stateUpdaters = {
         setIsRunning,
         setCurrentlyExecutingNodeId,
         setOutputLog,
         setGeneratedFiles
     };
-    executePipeline({ nodes, edges }, stateUpdaters);
+    executePipeline({ nodes, edges }, stateUpdaters, openAiApiKey);
   };
   
   const editingNode = nodes.find(n => n.id === editingNodeId);
@@ -896,6 +952,17 @@ const EditorPage = ({ workflowId, onNavigateHome }) => {
           </div>
         </div>
        </div>
+       {isApiKeyModalOpen && (
+            <ApiKeyModal
+                onSave={(key) => {
+                    setOpenAiApiKey(key);
+                    setIsApiKeyModalOpen(false);
+                    const stateUpdaters = { setIsRunning, setCurrentlyExecutingNodeId, setOutputLog, setGeneratedFiles };
+                    executePipeline({ nodes, edges }, stateUpdaters, key);
+                }}
+                onCancel={() => setIsApiKeyModalOpen(false)}
+            />
+        )}
     </div>
   );
 };
@@ -903,6 +970,9 @@ const EditorPage = ({ workflowId, onNavigateHome }) => {
 const HomePage = ({ onNavigateToEditor }) => {
     const [workflows, setWorkflows] = useState([]);
     const [runningStates, setRunningStates] = useState({}); // { [id]: 'running' | 'success' | 'error' }
+    const [openAiApiKey, setOpenAiApiKey] = useState("");
+    const [isApiKeyModalOpen, setIsApiKeyModalOpen] = useState(false);
+    const [pendingWorkflowRun, setPendingWorkflowRun] = useState(null);
     const [currentTheme, setCurrentTheme] = useState(localStorage.getItem('workflow-theme') || 'light-default');
 
 
@@ -927,6 +997,13 @@ const HomePage = ({ onNavigateToEditor }) => {
     }, []);
 
     const handleRunWorkflow = (workflow) => {
+        const needsOpenAI = workflow.data.nodes.some(n => n.type === 'prompt' && n.settings.llm === 'gpt-4');
+        if (needsOpenAI && !openAiApiKey) {
+            setPendingWorkflowRun(workflow);
+            setIsApiKeyModalOpen(true);
+            return;
+        }
+        
         const stateUpdaters = {
             setIsRunning: (isRunning) => {
                 setRunningStates(prev => ({
@@ -950,7 +1027,7 @@ const HomePage = ({ onNavigateToEditor }) => {
             setOutputLog: () => {},
             setGeneratedFiles: () => {},
         };
-        executePipeline(workflow.data, stateUpdaters);
+        executePipeline(workflow.data, stateUpdaters, openAiApiKey);
     };
 
     const deleteWorkflow = (id) => {
@@ -1019,6 +1096,22 @@ const HomePage = ({ onNavigateToEditor }) => {
                     })
                 )}
             </main>
+             {isApiKeyModalOpen && (
+                <ApiKeyModal
+                    onSave={(key) => {
+                        setOpenAiApiKey(key);
+                        setIsApiKeyModalOpen(false);
+                        if (pendingWorkflowRun) {
+                            handleRunWorkflow(pendingWorkflowRun);
+                            setPendingWorkflowRun(null);
+                        }
+                    }}
+                    onCancel={() => {
+                        setIsApiKeyModalOpen(false)
+                        setPendingWorkflowRun(null);
+                    }}
+                />
+            )}
         </div>
     );
 };

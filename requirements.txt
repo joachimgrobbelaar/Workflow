@@ -1,7 +1,0 @@
-Flask>=2.0
-google-cloud-secret-manager>=2.0
-openai>=1.0
-deepseek-llm # Placeholder, assume this is the client library. If not, fallback to 'openai' with custom base_url.
-gunicorn>=20.0
-python-dotenv # For local development convenience
-google-auth
