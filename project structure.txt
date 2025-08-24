@@ -1,0 +1,16 @@
+Workflow/
+├── app.py
+├── ai_service.py
+├── workflow_manager.py
+├── requirements.txt
+├── startup_script.sh
+├── README.md
+├── .gitignore
+├── gunicorn_config.py
+├── templates/
+│   └── index.html
+└── static/
+    ├── css/
+    │   └── style.css
+    └── js/
+        └── home.js
