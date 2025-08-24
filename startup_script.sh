@@ -43,6 +43,7 @@ source "$VENV_DIR/bin/activate"
 # --- Step 4: Install Python dependencies ---
 echo "--- Installing Python dependencies from requirements.txt ---"
 pip install --upgrade pip
+sed -i '/deepseek-llm/d' requirements.txt
 pip install -r requirements.txt
 
 # --- Step 5: Create a systemd service for Gunicorn ---
@@ -61,25 +62,26 @@ EOL
 
 # Create the systemd service file
 # This will ensure Gunicorn starts on boot and restarts if it crashes
-sudo bash -c "cat <<EOF > /etc/systemd/system/workflow_app.service
+ # Create the systemd service file
+ # Use marnu as the user explicitly, and clean up the comments for systemd
+sudo bash -c "cat << 'EOF_SERVICE' > /etc/systemd/system/workflow_app.service
 [Unit]
 Description=Gunicorn instance to serve the Workflow App
 After=network.target
 
 [Service]
-User=$USER # Runs Gunicorn under the user who executed the script
-Group=www-data # Or another appropriate group
+User=marnu # Explicitly set to 'marnu'
+Group=www-data # Set to 'www-data' for Nginx integration
 WorkingDirectory=$APP_DIR
-Environment="PATH=$VENV_DIR/bin"
-Environment="GOOGLE_CLOUD_PROJECT=$GCP_PROJECT_ID" # Set project ID for Secret Manager
-ExecStart=$VENV_DIR/bin/gunicorn --config gunicorn_config.py $FLASK_APP_NAME:$FLASK_APP_NAME
+Environment=\"PATH=$VENV_DIR/bin\"
+Environment=\"GOOGLE_CLOUD_PROJECT=$GCP_PROJECT_ID\"
+ExecStart=$VENV_DIR/bin/gunicorn --config $APP_DIR/gunicorn_config.py $FLASK_APP_NAME:$FLASK_APP_NAME
 Restart=always
 Type=simple
-PIDFile=/run/workflow_app.pid # Optional: for type=forking if needed
 
 [Install]
 WantedBy=multi-user.target
-EOF"
+EOF_SERVICE"
 
 # --- Step 6: Start and enable the Gunicorn service ---
 echo "--- Starting and enabling Gunicorn service ---"
@@ -92,25 +94,32 @@ sudo systemctl enable workflow_app   # Enable the service to start on boot
 echo "--- Setting up Nginx as a reverse proxy (Optional but Recommended) ---"
 sudo systemctl start nginx
 sudo systemctl enable nginx
+        sudo bash -c "cat << 'EOF_NGINX' > /etc/nginx/sites-available/workflow_app
+        server {
+            listen 80; # Nginx listens on standard HTTP port
+            server_name _; # Listen on all available hostnames/IPs
 
-sudo bash -c "cat <<EOF > /etc/nginx/sites-available/workflow_app
-server {
-    listen 80;
-    server_name _; # Listen on all available hostnames/IPs
+            # Serve static files directly from Nginx for performance
+            location /static {
+                alias $APP_DIR/static;
+                expires 30d; # Cache static files for 30 days
+                add_header Cache-Control "public, no-transform"; # <<<--- Corrected line (removed backslashes)
+            }
 
-    location /static {
-        alias $APP_DIR/static; # Serve static files directly from Nginx
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:$LISTEN_PORT; # Forward requests to Gunicorn
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-EOF"
+            # Forward all other requests to Gunicorn
+            location / {
+                proxy_pass http://127.0.0.1:$LISTEN_PORT; # Proxy to Gunicorn's internal port
+                proxy_set_header Host \$host; # These don't need changing, Nginx expects \$
+                proxy_set_header X-Real-IP \$remote_addr;
+                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto \$scheme;
+                proxy_connect_timeout 600;
+                proxy_send_timeout 600;
+                proxy_read_timeout 600;
+                send_timeout 600;
+            }
+        }
+EOF_NGINX"
 
 # Enable the Nginx site and restart Nginx
 sudo ln -sf /etc/nginx/sites-available/workflow_app /etc/nginx/sites-enabled/
