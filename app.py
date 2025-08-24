@@ -1,0 +1,204 @@
+import os
+import json
+import time
+from flask import Flask, render_template, request, jsonify, redirect, url_for
+from google.cloud import secretmanager
+from google.auth import default # For local development project ID inference
+from dotenv import load_dotenv # For local testing with .env
+
+# Import your custom modules
+from ai_service import generate_text
+from workflow_manager import list_workflows, run_workflow, load_workflow, save_workflow
+
+# --- Initialize Flask app ---
+app = Flask(__name__)
+
+# --- Configuration ---
+# Your Google Cloud Project ID (set as env var by GCE/Cloud Run, or inferred locally)
+GCP_PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "studied-anchor-469110-c1")
+
+# --- Function to load API Keys from Secret Manager ---
+def load_api_keys():
+    print("Attempting to load API keys from Google Cloud Secret Manager...")
+    try:
+        # If running locally without GOOGLE_CLOUD_PROJECT set, try to infer it
+        if not GCP_PROJECT_ID:
+            print("WARNING: GOOGLE_CLOUD_PROJECT environment variable not set. Attempting to infer project ID from default credentials.")
+            credentials, inferred_project = default()
+            if inferred_project:
+                global GCP_PROJECT_ID
+                GCP_PROJECT_ID = inferred_project
+                print(f"Inferred GCP Project ID: {GCP_PROJECT_ID}")
+            else:
+                print("CRITICAL: Could not infer GCP Project ID. AI services will be unavailable.")
+                app.config['OPENAI_KEY'] = None
+                app.config['DEEPSEEK_KEY'] = None
+                return
+
+        # Ensure we have a project ID to proceed
+        if not GCP_PROJECT_ID:
+            print("CRITICAL: GCP Project ID is still unknown. AI services will be unavailable.")
+            app.config['OPENAI_KEY'] = None
+            app.config['DEEPSEEK_KEY'] = None
+            return
+
+        client = secretmanager.SecretManagerServiceClient()
+
+        openai_secret_name = f"projects/{GCP_PROJECT_ID}/secrets/OPENAI_API_KEY/versions/latest"
+        deepseek_secret_name = f"projects/{GCP_PROJECT_ID}/secrets/DEEPSEEK_API_KEY/versions/latest"
+
+        # Access OpenAI key
+        try:
+            openai_response = client.access_secret_version(request={"name": openai_secret_name})
+            app.config['OPENAI_KEY'] = openai_response.payload.data.decode("UTF-8")
+            print("OpenAI API Key successfully retrieved.")
+        except Exception as e:
+            print(f"WARNING: Failed to retrieve OpenAI API Key from Secret Manager: {e}")
+            app.config['OPENAI_KEY'] = None
+
+        # Access DeepSeek key
+        try:
+            deepseek_response = client.access_secret_version(request={"name": deepseek_secret_name})
+            app.config['DEEPSEEK_KEY'] = deepseek_response.payload.data.decode("UTF-8")
+            print("DeepSeek API Key successfully retrieved.")
+        except Exception as e:
+            print(f"WARNING: Failed to retrieve DeepSeek API Key from Secret Manager: {e}")
+            app.config['DEEPSEEK_KEY'] = None
+
+    except Exception as e:
+        print(f"ERROR: General error during Secret Manager client initialization or access: {e}")
+        app.config['OPENAI_KEY'] = None
+        app.config['DEEPSEEK_KEY'] = None
+
+# Load API keys at application startup.
+# Using app.app_context() ensures Flask's context is available for config.
+with app.app_context():
+    load_api_keys()
+
+# --- Routes ---
+
+@app.route('/')
+def home():
+    """Renders the home page."""
+    return render_template('index.html')
+
+@app.route('/api/workflows', methods=['GET'])
+def get_workflows_api():
+    """Returns a JSON list of all available workflows."""
+    workflows = list_workflows() # From workflow_manager.py
+    return jsonify(workflows)
+
+@app.route('/api/run_workflow/<workflow_id>', methods=['POST'])
+def run_workflow_api_endpoint(workflow_id):
+    """Triggers the execution of a specific workflow."""
+    print(f"Received request to run workflow: {workflow_id}")
+    try:
+        # Call the actual workflow execution logic from workflow_manager.py
+        run_workflow(workflow_id)
+        return jsonify({"status": "success", "message": f"Workflow '{workflow_id}' started successfully."})
+    except Exception as e:
+        print(f"Error running workflow '{workflow_id}': {e}")
+        return jsonify({"status": "error", "message": f"Failed to start workflow '{workflow_id}': {str(e)}"}), 500
+
+@app.route('/api/generate_ai_content', methods=['POST'])
+def generate_ai_content_api():
+    """Generates AI content using OpenAI or DeepSeek."""
+    data = request.json
+    prompt = data.get("prompt")
+    model_choice = data.get("model", "openai") # Default to openai if not specified
+    temperature = data.get("temperature", 0.7) # Example: Allow temperature param
+
+    if not prompt:
+        return jsonify({"status": "error", "message": "No prompt provided."}), 400
+
+    openai_key = app.config.get('OPENAI_KEY')
+    deepseek_key = app.config.get('DEEPSEEK_KEY')
+
+    if model_choice == "openai" and not openai_key:
+        return jsonify({"status": "error", "message": "OpenAI API key not available or configured."}), 500
+    if model_choice == "deepseek" and not deepseek_key:
+        return jsonify({"status": "error", "message": "DeepSeek API key not available or configured."}), 500
+
+    try:
+        generated_text = generate_text(model_choice, prompt, openai_key, deepseek_key, temperature=temperature)
+        return jsonify({"status": "success", "generated_text": generated_text})
+    except Exception as e:
+        print(f"Error generating AI content for model '{model_choice}': {e}")
+        return jsonify({"status": "error", "message": f"Failed to generate AI content: {str(e)}"}), 500
+
+@app.route('/edit/<workflow_id>')
+def edit_workflow(workflow_id):
+    """Placeholder for the workflow editor page for an existing workflow."""
+    workflow_data = load_workflow(workflow_id) # From workflow_manager.py
+    if not workflow_data:
+        # Handle case where workflow_id doesn't exist
+        return render_template('editor.html', workflow={"id": "new", "name": "Error: Workflow Not Found"})
+    return render_template('editor.html', workflow=workflow_data)
+
+@app.route('/edit/new')
+def new_workflow():
+    """Placeholder for the new workflow creation page."""
+    # The editor.html template can handle an empty/default workflow for creation
+    return render_template('editor.html', workflow={"id": "new", "name": "New Workflow", "description": ""})
+
+@app.route('/api/save_workflow', methods=['POST'])
+def save_workflow_api():
+    """Saves a workflow from the editor."""
+    data = request.json
+    workflow_id = data.get("id")
+    workflow_name = data.get("name")
+    workflow_description = data.get("description")
+    workflow_steps = data.get("steps") # Assuming workflow has 'steps'
+
+    if not workflow_id or not workflow_name:
+        return jsonify({"status": "error", "message": "Workflow ID and name are required."}), 400
+
+    try:
+        # Save logic from workflow_manager.py
+        save_workflow(workflow_id, {"id": workflow_id, "name": workflow_name, "description": workflow_description, "steps": workflow_steps})
+        return jsonify({"status": "success", "message": f"Workflow '{workflow_name}' saved successfully."})
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Failed to save workflow '{workflow_name}': {str(e)}"}), 500
+
+
+# --- Local Development Server Startup ---
+# This block is ONLY for local development. Gunicorn will manage the server in production.
+if __name__ == '__main__':
+    # Load .env file for local environment variables (e.g., local API keys if not using Secret Manager locally)
+    load_dotenv()
+
+    # Ensure a 'workflows' directory exists for local demo
+    if not os.path.exists('workflows'):
+        os.makedirs('workflows')
+        # Create a dummy workflow file if it doesn't exist
+        dummy_workflow_path = os.path.join('workflows', 'sample_pipeline.json')
+        if not os.path.exists(dummy_workflow_path):
+            with open(dummy_workflow_path, 'w') as f:
+                json.dump({
+                    "id": "sample_pipeline",
+                    "name": "Sample Data Processing Pipeline",
+                    "description": "A basic workflow for demonstrating run and edit functionality.",
+                    "steps": [
+                        {"type": "log", "message": "Starting data processing..."},
+                        {"type": "data_fetch", "source": "example_api"},
+                        {"type": "transform", "script": "script.py"},
+                        {"type": "log", "message": "Data processing complete!"}
+                    ]
+                }, f, indent=4)
+        
+        dummy_workflow_path_2 = os.path.join('workflows', 'ai_generation.json')
+        if not os.path.exists(dummy_workflow_path_2):
+            with open(dummy_workflow_path_2, 'w') as f:
+                json.dump({
+                    "id": "ai_generation",
+                    "name": "AI Content Generation Example",
+                    "description": "Workflow to generate text using an AI model.",
+                    "steps": [
+                        {"type": "log", "message": "Generating AI content..."},
+                        {"type": "ai_generate", "model": "openai", "prompt": "Write a short poem about a sunny day."}
+                    ]
+                }, f, indent=4)
+
+
+    print("Starting Flask development server...")
+    app.run(host='0.0.0.0', port=5000, debug=True) # debug=True is for dev only
